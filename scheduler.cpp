@@ -4,41 +4,14 @@
 #include <list>
 #include <vector>
 #include <array>
-#include <stdexcept>
+#include <algorithm>
 #include <limits>
 
 constexpr int MAX_PROC = 64;     // 最大进程数
 constexpr int DEFAULT_SLICE = 2; // 默认时间片大小
 constexpr int MFQ_LEVELS = 3;    // 多级反馈队列层数
 
-/*进程五个状态 */
-enum class ProcState
-{
-    FREE,
-    READY,
-    RUNNING,
-    BLOCKED,
-    FINISHED
-};
-
-/* 状态名称 */
-static const char *stateName(ProcState s)
-{
-    switch (s)
-    {
-    case ProcState::FREE:
-        return "FREE";
-    case ProcState::READY:
-        return "READY";
-    case ProcState::RUNNING:
-        return "RUNNING";
-    case ProcState::BLOCKED:
-        return "BLOCKED";
-    case ProcState::FINISHED:
-        return "FINISHED";
-    }
-    return "UNKNOWN";
-}
+// 进程状态用字符串表示：FREE / READY / RUNNING / BLOCKED / FINISHED
 
 struct PCB
 {
@@ -46,7 +19,7 @@ struct PCB
     std::string name; // 进程名称
 
     /* 状态与运行时间 */
-    ProcState state = ProcState::FREE;
+    std::string state = "FREE";
     int total_time = 0;     /* 总 CPU 时间 */
     int remaining_time = 0; /* 剩余 CPU 时间 */
     int slice_used = 0;     /* 当前时间片已用 */
@@ -95,21 +68,6 @@ static PCB *dequeue(ProcQueue &q)
     return p;
 }
 
-/* 在q中按 pid 查找进程并出队 */
-static PCB *dequeue_by_pid(ProcQueue &q, int pid)
-{
-    for (auto it = q.begin(); it != q.end(); ++it)
-    {
-        if ((*it)->pid == pid)
-        {
-            PCB *p = *it;
-            q.erase(it);
-            return p;
-        }
-    }
-    return nullptr;
-}
-
 static void print_queue(const std::string &label, const ProcQueue &q)
 {
     std::cout << "  [" << label << "] (" << q.size() << "): ";
@@ -121,35 +79,29 @@ static void print_queue(const std::string &label, const ProcQueue &q)
 /*打印pcb */
 static void print_pcb(const PCB *p)
 {
-    std::cout << "  ┌─── PCB: " << p->name << " (PID=" << p->pid << ") ───\n"
-              << "  │ 状态      : " << stateName(p->state) << "\n"
-              << "  │ 总运行时  : " << p->total_time << "\n"
-              << "  │ 剩余时间  : " << p->remaining_time << "\n"
-              << "  │ 已调度次  : " << p->dispatch_count << "\n"
-              << "  │ reg_PC    : " << p->reg_pc << "\n"
-              << "  │ reg_ACC   : " << p->reg_acc << "\n";
-    if (use_mfq)
-        std::cout << "  │ MFQ层次   : " << p->mfq_level << "\n";
-    std::cout << "  └────────────────────────\n";
+    std::cout << "  PCB " << p->name << "(P" << p->pid << ")"
+              << " 状态=" << p->state
+              << " 总时=" << p->total_time
+              << " 剩余=" << p->remaining_time
+              << " 调度次=" << p->dispatch_count
+              << " PC=" << p->reg_pc << " ACC=" << p->reg_acc;
+    if (use_mfq) std::cout << " MFQ=" << p->mfq_level;
+    std::cout << "\n";
 }
 
 /* 打印队列快照 */
 static void print_snapshot()
 {
-    std::cout << "\n  ─── 系统时钟=" << sys_clock << "  队列快照 ───\n";
+    std::cout << "\n[快照] 时钟=" << sys_clock << "\n";
     if (!use_mfq)
-    {
         print_queue("就绪", ready_queue);
-    }
     else
-    {
         for (int i = 0; i < MFQ_LEVELS; i++)
             print_queue("就绪MFQ[" + std::to_string(i) + "]", mfq[i]);
-    }
     print_queue("运行", run_queue);
     print_queue("阻塞", blocked_queue);
     print_queue("完成", finished_queue);
-    std::cout << "  ────────────────────────────\n\n";
+    std::cout << "\n";
 }
 
 /* 初始化*/
@@ -158,7 +110,6 @@ static void init_system()
     for (int i = 0; i < MAX_PROC; i++)
     {
         pcb_pool[i] = PCB{};
-        pcb_pool[i].state = ProcState::FREE;
         enqueue(free_queue, &pcb_pool[i]);
     }
     for (int i = 0; i < MFQ_LEVELS; i++)
@@ -182,7 +133,7 @@ static PCB *create_process(const std::string &name, int total_time, int io_at, i
     }
     p->pid = next_pid++;
     p->name = name;
-    p->state = ProcState::READY;
+    p->state = "READY";
     p->total_time = total_time;
     p->remaining_time = total_time;
     p->slice_used = 0;
@@ -224,12 +175,12 @@ static PCB *schedule()
 /* ======================== 原语：进程阻塞 ======================== */
 static void block_process(PCB *p)
 {
-    if (!p or p->state != ProcState::RUNNING)
+    if (!p || p->state != "RUNNING")
         return;
     p->reg_pc += p->slice_used; // 保存现场
     p->reg_acc += p->slice_used * 2;
-    dequeue_by_pid(run_queue, p->pid);
-    p->state = ProcState::BLOCKED;
+    run_queue.pop_front();
+    p->state = "BLOCKED";
     p->io_remaining = p->io_duration;
     enqueue(blocked_queue, p);
     std::cout << "[阻塞] 进程 " << p->name << " (PID=" << p->pid << ") 进入阻塞状态\n";
@@ -239,10 +190,10 @@ static void block_process(PCB *p)
 /* ======================== 原语：进程唤醒 ======================== */
 static void wakeup_process(PCB *p)
 {
-    if (!p || p->state != ProcState::BLOCKED)
+    if (!p || p->state != "BLOCKED")
         return;
-    dequeue_by_pid(blocked_queue, p->pid);
-    p->state = ProcState::READY;
+    blocked_queue.remove(p);
+    p->state = "READY";
     p->io_remaining = 0;
     if (!use_mfq)
         enqueue(ready_queue, p);
@@ -255,8 +206,8 @@ static void wakeup_process(PCB *p)
 /* ======================== 进程完成 ======================== */
 static void finish_process(PCB *p)
 {
-    dequeue_by_pid(run_queue, p->pid);
-    p->state = ProcState::FINISHED;
+    run_queue.pop_front();
+    p->state = "FINISHED";
     p->remaining_time = 0;
     enqueue(finished_queue, p);
     std::cout << "[完成] 进程 " << p->name << " (PID=" << p->pid << ") 运行结束\n";
@@ -266,11 +217,11 @@ static void finish_process(PCB *p)
 /* ======================== 时间片用完（抢占） ======================== */
 static void preempt_process(PCB *p)
 {
-    dequeue_by_pid(run_queue, p->pid);
+    run_queue.pop_front();
     p->reg_pc += p->slice_used;
     p->reg_acc += p->slice_used * 2;
     p->slice_used = 0;
-    p->state = ProcState::READY;
+    p->state = "READY";
     if (!use_mfq)
     {
         enqueue(ready_queue, p);
@@ -286,10 +237,10 @@ static void preempt_process(PCB *p)
     print_snapshot();
 }
 
-/* ======================== 调度上 CPU ======================== */
+/* 调度上 CPU */
 static void dispatch(PCB *p)
 {
-    p->state = ProcState::RUNNING;
+    p->state = "RUNNING";
     p->dispatch_count++;
     p->slice_used = 0;
     enqueue(run_queue, p);
@@ -334,8 +285,7 @@ static void advance_io()
 /* ======================== 场景一：自动仿真 ======================== */
 static void auto_simulate()
 {
-    std::cout << "\n========== 自动仿真模式（时间片轮转"
-              << (use_mfq ? " + 多级反馈队列" : "") << "）==========\n";
+    std::cout << "\n自动仿真（" << (use_mfq ? "MFQ" : "RR") << "）\n";
 
     PCB *running = nullptr;
 
@@ -408,8 +358,7 @@ static void auto_simulate()
         }
     }
 
-    std::cout << "\n========== 仿真结束，系统时钟=" << sys_clock << " ==========\n";
-    std::cout << "已完成进程：\n";
+    std::cout << "\n仿真结束，时钟=" << sys_clock << "\n已完成进程：\n";
     for (const auto *p : finished_queue)
         print_pcb(p);
 }
@@ -417,16 +366,8 @@ static void auto_simulate()
 /* ======================== 场景二：人工干预 ======================== */
 static void manual_simulate()
 {
-    std::cout << "\n========== 人工干预模式（时间片轮转"
-              << (use_mfq ? " + 多级反馈队列" : "") << "）==========\n"
-              << "命令：enter | esc | wakeup | finished | tick | show | quit\n"
-              << "  enter    - 调度下一个进程（当前回就绪）\n"
-              << "  esc      - 当前进程阻塞\n"
-              << "  wakeup   - 唤醒一个阻塞进程\n"
-              << "  finished - 当前进程完成\n"
-              << "  tick     - 时钟推进一格\n"
-              << "  show     - 显示队列快照\n"
-              << "  quit     - 退出\n\n";
+    std::cout << "\n人工干预（" << (use_mfq ? "MFQ" : "RR") << "）\n"
+              << "命令：enter | esc | wakeup | finished | tick | show | quit\n\n";
 
     PCB *running = schedule();
     if (running)
@@ -451,8 +392,8 @@ static void manual_simulate()
             {
                 std::cout << "[退出CPU] 进程 " << running->name << " PCB:\n";
                 print_pcb(running);
-                dequeue_by_pid(run_queue, running->pid);
-                running->state = ProcState::READY;
+                run_queue.pop_front();
+                running->state = "READY";
                 running->slice_used = 0;
                 running->reg_pc += 1;
                 running->reg_acc += 2;
@@ -500,17 +441,10 @@ static void manual_simulate()
             int wpid;
             if (std::cin >> wpid)
             {
-                PCB *wp = nullptr;
-                for (auto *bp : blocked_queue)
-                {
-                    if (bp->pid == wpid)
-                    {
-                        wp = bp;
-                        break;
-                    }
-                }
-                if (wp)
-                    wakeup_process(wp);
+                auto it = std::find_if(blocked_queue.begin(), blocked_queue.end(),
+                                       [wpid](PCB *p) { return p->pid == wpid; });
+                if (it != blocked_queue.end())
+                    wakeup_process(*it);
                 else
                     std::cout << "[错误] 未找到 PID=" << wpid << " 的阻塞进程\n";
             }
@@ -637,9 +571,7 @@ static void setup_processes()
 /* ======================== main ======================== */
 int main()
 {
-    std::cout << "╔══════════════════════════════════════╗\n"
-              << "║     单处理机进程调度模拟系统           ║\n"
-              << "╚══════════════════════════════════════╝\n\n";
+    std::cout << "单处理机进程调度模拟\n\n";
 
     init_system();
 
